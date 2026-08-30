@@ -15,7 +15,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 3
 
     steps:
       - name: Checkout repository
@@ -36,7 +36,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_SERVER: https://ntfy.sh
           TARGET_URL: https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/
-          CHECKS_PER_RUN: '5'
+          CHECKS_PER_RUN: '1'
           INTERVAL_SECONDS: '60'
           NOTIFY_REMOVED: 'false'
           CHROME_PATH: /usr/bin/google-chrome
