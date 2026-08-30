@@ -2,7 +2,12 @@ name: DAB Housing Monitor
 
 on:
   schedule:
-    - cron: '2-57/5 * * * *'
+    - cron: '2-57/5 7-17 * * 1-5'
+      timezone: 'Europe/Copenhagen'
+
+    - cron: '0 18 * * 1-5'
+      timezone: 'Europe/Copenhagen'
+
   workflow_dispatch:
 
 permissions:
