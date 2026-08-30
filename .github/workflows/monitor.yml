@@ -1,0 +1,59 @@
+name: DAB Housing Monitor
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dab-housing-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: https://ntfy.sh
+          TARGET_URL: https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/
+          CHECKS_PER_RUN: '5'
+          INTERVAL_SECONDS: '60'
+          NOTIFY_REMOVED: 'false'
+          CHROME_PATH: /usr/bin/google-chrome
+        run: node monitor.mjs
+
+      - name: Save changed listing state
+        if: success()
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "No state change to commit."
+            exit 0
+          fi
+
+          git config user.name "dab-housing-monitor[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update DAB housing monitor state"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
