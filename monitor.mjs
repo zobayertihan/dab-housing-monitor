@@ -2,11 +2,6 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { chromium } from 'playwright-core';
 
-
-/* =========================================================
-   CONFIGURATION
-========================================================= */
-
 const TARGET_URL =
   process.env.TARGET_URL ||
   'https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/';
@@ -14,23 +9,16 @@ const TARGET_URL =
 const NTFY_SERVER =
   (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
 
-const NTFY_TOPIC =
-  process.env.NTFY_TOPIC || '';
+const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
+const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 
-const STATE_FILE =
-  process.env.STATE_FILE || 'state.json';
-
-const CHROME_PATH =
-  process.env.CHROME_PATH || '/usr/bin/google-chrome';
-
+const STATE_FILE = 'state.json';
 const MAX_POSTCODE = 3000;
 
 
-/* =========================================================
-   BASIC HELPERS
-========================================================= */
+/* ---------- helpers ---------- */
 
-function normalize(text = '') {
+function clean(text = '') {
   return text
     .replace(/\u00a0/g, ' ')
     .replace(/\r/g, '')
@@ -40,114 +28,46 @@ function normalize(text = '') {
     .trim();
 }
 
-
-function sha256(text) {
+function hash(value) {
   return crypto
     .createHash('sha256')
-    .update(text)
+    .update(value)
     .digest('hex');
 }
 
-
-function normalizeMoney(value = '') {
-  if (!value) {
-    return '';
-  }
-
-  let text = value
-    .replace(/\s+/g, ' ')
+function money(value = '') {
+  return value
+    .replace(/\s*(kr\.?|kroner)\s*$/i, ' DKK')
+    .replace(/^(\d{1,3})\.(\d{3})(?!\d)/, '$1,$2')
     .trim();
+}
 
-  /*
-    Danish:
-    7.180 kr.
-    becomes:
-    7,180 DKK
-  */
+function propertyType(text = '') {
+  const t = text.toLowerCase();
 
-  text = text
-    .replace(/\./g, ',')
-    .replace(/\s*(?:kr\.?|kroner)\s*$/i, ' DKK')
-    .trim();
+  if (t.includes('etagebolig')) return 'Apartment';
+  if (t.includes('rækkehus') || t.includes('raekkehus')) return 'Townhouse';
+  if (t.includes('ungdomsbolig')) return 'Youth housing';
+  if (t.includes('ældrebolig')) return 'Senior housing';
+  if (t.includes('familiebolig')) return 'Family housing';
 
   return text;
 }
 
 
-function translatePropertyType(value = '') {
-  const lower = value.toLowerCase();
+/* ---------- parse one listing ---------- */
 
-  if (lower.includes('etagebolig')) {
-    return 'Apartment';
-  }
+function parseListing(text, url = TARGET_URL) {
+  const lines = clean(text)
+    .split('\n')
+    .map(x => x.trim())
+    .filter(Boolean);
 
-  if (
-    lower.includes('rækkehus') ||
-    lower.includes('raekkehus')
-  ) {
-    return 'Townhouse';
-  }
+  const rentIndex = lines.findIndex(x =>
+    /^(Husleje|Rent)\s*:/i.test(x)
+  );
 
-  if (
-    lower.includes('parcelhus') ||
-    lower.includes('enfamiliehus')
-  ) {
-    return 'House';
-  }
-
-  if (lower.includes('ungdomsbolig')) {
-    return 'Youth housing';
-  }
-
-  if (lower.includes('ældrebolig')) {
-    return 'Senior housing';
-  }
-
-  if (lower.includes('familiebolig')) {
-    return 'Family housing';
-  }
-
-  /*
-    Unknown type:
-    keep original wording.
-  */
-
-  return value;
-}
-
-
-/* =========================================================
-   PARSE ONE HOUSING LISTING
-========================================================= */
-
-function parseListing(text, url = '') {
-
-  const lines =
-    normalize(text)
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean);
-
-
-  const rentIndex =
-    lines.findIndex(line =>
-      /^(?:Husleje|Rent)\s*:/i.test(line)
-    );
-
-
-  if (rentIndex === -1) {
-    return null;
-  }
-
-
-  /*
-    Find postcode/city before Rent.
-
-    Example:
-    Rødovre Parkvej 229 7. sal
-    2610 Rødovre
-    Husleje: ...
-  */
+  if (rentIndex === -1) return null;
 
   let postcodeIndex = -1;
 
@@ -156,1434 +76,545 @@ function parseListing(text, url = '') {
     i >= Math.max(0, rentIndex - 5);
     i--
   ) {
-
     if (/^\d{4}\s+.+/.test(lines[i])) {
       postcodeIndex = i;
       break;
     }
   }
 
-
-  if (postcodeIndex === -1) {
-    return null;
-  }
-
+  if (postcodeIndex === -1) return null;
 
   const postcodeMatch =
-    lines[postcodeIndex].match(
-      /^(\d{4})\s+(.+)$/
-    );
+    lines[postcodeIndex].match(/^(\d{4})\s+(.+)$/);
 
+  if (!postcodeMatch) return null;
 
-  if (!postcodeMatch) {
-    return null;
-  }
+  const postcode = Number(postcodeMatch[1]);
+  const city = postcodeMatch[2].trim();
 
-
-  const postcode =
-    Number(postcodeMatch[1]);
-
-  const city =
-    postcodeMatch[2].trim();
-
-
-  /*
-    Ignore everything above postcode 3000.
-  */
-
-  if (
-    postcode < 0 ||
-    postcode > MAX_POSTCODE
-  ) {
-    return null;
-  }
-
+  // Ignore homes outside the requested area.
+  if (postcode > MAX_POSTCODE) return null;
 
   const address =
-    postcodeIndex > 0
-      ? lines[postcodeIndex - 1]
-      : 'Unknown address';
-
+    lines[postcodeIndex - 1] || 'Unknown address';
 
   const rentLine =
-    lines.find(line =>
-      /^(?:Husleje|Rent)\s*:/i.test(line)
-    ) || '';
-
+    lines.find(x => /^(Husleje|Rent)\s*:/i.test(x)) || '';
 
   const depositLine =
-    lines.find(line =>
-      /^(?:Indskud|Depositum|Deposit)\s*:/i.test(line)
+    lines.find(x =>
+      /^(Indskud|Depositum|Deposit)\s*:/i.test(x)
     ) || '';
-
 
   const periodLine =
-    lines.find(line =>
-      /^(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i.test(line)
+    lines.find(x =>
+      /^(Udlejningsperiode|Lejeperiode|Rental period)\s*:/i.test(x)
     ) || '';
 
+  const detailsLine =
+    lines.find(x =>
+      /\d+\s*rums?|rooms?|kvm|m²|m2/i.test(x)
+    ) || '';
 
-  const rent =
-    normalizeMoney(
-      rentLine
-        .replace(
-          /^(?:Husleje|Rent)\s*:\s*/i,
-          ''
-        )
-    );
+  const rent = money(
+    rentLine.replace(/^(Husleje|Rent)\s*:\s*/i, '')
+  );
 
+  const deposit = money(
+    depositLine.replace(
+      /^(Indskud|Depositum|Deposit)\s*:\s*/i,
+      ''
+    )
+  );
 
-  const deposit =
-    normalizeMoney(
-      depositLine
-        .replace(
-          /^(?:Indskud|Depositum|Deposit)\s*:\s*/i,
-          ''
-        )
-    );
-
-
-  const period =
-    periodLine
-      .replace(
-        /^(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:\s*/i,
-        ''
-      )
-      .trim();
-
-
-  /*
-    Example:
-    Etagebolig, 3 rums, 85 kvm
-  */
-
-  let detailsLine = '';
-
-  for (const line of lines) {
-
-    if (
-      /(?:\d+\s*(?:rums?|rooms?))|(?:\d+(?:[.,]\d+)?\s*(?:kvm|m²|m2))/i
-        .test(line)
-    ) {
-      detailsLine = line;
-      break;
-    }
-  }
-
-
-  let rooms = '';
+  const period = periodLine.replace(
+    /^(Udlejningsperiode|Lejeperiode|Rental period)\s*:\s*/i,
+    ''
+  );
 
   const roomsMatch =
-    detailsLine.match(
-      /(\d+)\s*(?:rums?|rooms?)/i
-    );
-
-  if (roomsMatch) {
-    rooms = roomsMatch[1];
-  }
-
-
-  let area = '';
+    detailsLine.match(/(\d+)\s*(?:rums?|rooms?)/i);
 
   const areaMatch =
-    detailsLine.match(
-      /(\d+(?:[.,]\d+)?)\s*(?:kvm|m²|m2)/i
-    );
+    detailsLine.match(/(\d+(?:[.,]\d+)?)\s*(?:kvm|m²|m2)/i);
 
-  if (areaMatch) {
-    area =
-      `${areaMatch[1].replace(',', '.')} m²`;
-  }
-
-
-  let propertyType = '';
-
-  if (detailsLine.includes(',')) {
-    propertyType =
-      translatePropertyType(
-        detailsLine.split(',')[0].trim()
-      );
-  }
-
-
-  /*
-    Address is used as stable identity.
-
-    This means:
-    - rent changing doesn't create a "new" home
-    - deposit changing doesn't create a "new" home
-    - rental period changing doesn't create a "new" home
-  */
-
-  const id =
-    `${address}|${postcode}|${city}`
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
+  const type =
+    detailsLine.includes(',')
+      ? propertyType(detailsLine.split(',')[0].trim())
+      : '';
 
   const listing = {
-    id,
+    id: `${address}|${postcode}|${city}`.toLowerCase(),
     address,
     postcode,
     city,
     rent,
     deposit,
-    propertyType,
-    rooms,
-    area,
+    type,
+    rooms: roomsMatch?.[1] || '',
+    area: areaMatch
+      ? `${areaMatch[1].replace(',', '.')} m²`
+      : '',
     period,
-    url: url || TARGET_URL
+    url
   };
 
-
-  /*
-    URL is intentionally excluded from signature.
-
-    If DAB changes its internal URL format,
-    we don't want a false "property updated" alert.
-  */
-
-  listing.signature =
-    sha256(
-      JSON.stringify({
-        address: listing.address,
-        postcode: listing.postcode,
-        city: listing.city,
-        rent: listing.rent,
-        deposit: listing.deposit,
-        propertyType: listing.propertyType,
-        rooms: listing.rooms,
-        area: listing.area,
-        period: listing.period
-      })
-    );
-
+  listing.signature = hash(
+    JSON.stringify({
+      address: listing.address,
+      postcode: listing.postcode,
+      city: listing.city,
+      rent: listing.rent,
+      deposit: listing.deposit,
+      type: listing.type,
+      rooms: listing.rooms,
+      area: listing.area,
+      period: listing.period
+    })
+  );
 
   return listing;
 }
 
 
-/* =========================================================
-   STATE MANAGEMENT
-========================================================= */
+/* ---------- state ---------- */
 
-function loadRawState() {
-
+function loadState() {
   try {
-    return JSON.parse(
-      fs.readFileSync(
-        STATE_FILE,
-        'utf8'
-      )
-    );
+    const state =
+      JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+
+    return state.version === 5 &&
+      state.listings &&
+      typeof state.listings === 'object'
+      ? state.listings
+      : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-
 function saveState(listings) {
-
   const map = {};
 
-  for (const listing of listings) {
-    map[listing.id] = listing;
+  for (const item of listings) {
+    map[item.id] = item;
   }
-
-
-  const state = {
-    version: 4,
-    updated_at: new Date().toISOString(),
-    postcode_limit: MAX_POSTCODE,
-    count: listings.length,
-    listings: map
-  };
-
 
   fs.writeFileSync(
     STATE_FILE,
-    JSON.stringify(state, null, 2) + '\n'
+    JSON.stringify({
+      version: 5,
+      updated_at: new Date().toISOString(),
+      postcode_limit: MAX_POSTCODE,
+      listings: map
+    }, null, 2) + '\n'
   );
 }
 
 
-/*
-  Convert older state.json versions to the
-  new address-based format.
+/* ---------- ntfy ---------- */
 
-  This is important because you already have
-  a working baseline.
+function notificationText(home) {
+  const lines = [
+    home.address,
+    `${home.postcode} ${home.city}`
+  ];
 
-  We don't want all existing homes to suddenly
-  appear as "NEW".
-*/
+  if (home.rent)
+    lines.push(`Rent: ${home.rent}`);
 
-function migrateOldState(rawState) {
+  if (home.deposit)
+    lines.push(`Deposit: ${home.deposit}`);
 
-  const result = {};
+  const details = [];
 
+  if (home.type)
+    details.push(home.type);
 
-  /*
-    Already version 4.
-  */
+  if (home.rooms)
+    details.push(
+      `${home.rooms} ${home.rooms === '1' ? 'room' : 'rooms'}`
+    );
 
-  if (
-    rawState.version === 4 &&
-    rawState.listings &&
-    !Array.isArray(rawState.listings)
-  ) {
+  if (home.area)
+    details.push(home.area);
 
-    for (
-      const [id, listing]
-      of Object.entries(rawState.listings)
-    ) {
+  if (details.length)
+    lines.push(details.join(' • '));
 
-      if (
-        Number(listing.postcode) <= MAX_POSTCODE
-      ) {
-        result[id] = listing;
-      }
-    }
+  if (home.period)
+    lines.push(`Rental period: ${home.period}`);
 
+  lines.push('');
+  lines.push(
+    home.url !== TARGET_URL
+      ? 'Tap to open this exact home.'
+      : 'Tap to open DAB.'
+  );
 
-    return result;
+  return lines.join('\n');
+}
+
+async function notify(title, home, tags) {
+  if (!NTFY_TOPIC) {
+    throw new Error('NTFY_TOPIC is missing.');
   }
 
+  const response = await fetch(NTFY_SERVER, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      topic: NTFY_TOPIC,
+      title,
+      message: notificationText(home),
+      priority: 5,
+      tags,
+      click: home.url || TARGET_URL
+    })
+  });
 
-  /*
-    Previous version:
-    listings = array of text strings.
-  */
-
-  if (
-    Array.isArray(rawState.listings)
-  ) {
-
-    for (const oldText of rawState.listings) {
-
-      if (typeof oldText !== 'string') {
-        continue;
-      }
-
-
-      const parsed =
-        parseListing(
-          oldText,
-          TARGET_URL
-        );
-
-
-      if (parsed) {
-        result[parsed.id] = parsed;
-      }
-    }
-
-
-    return result;
+  if (!response.ok) {
+    throw new Error(
+      `ntfy error ${response.status}: ${await response.text()}`
+    );
   }
-
-
-  /*
-    Even older version:
-    one big snapshot string.
-  */
-
-  if (
-    typeof rawState.snapshot === 'string'
-  ) {
-
-    const oldListings =
-      extractListingsFromPlainText(
-        rawState.snapshot
-      );
-
-
-    for (const listing of oldListings) {
-      result[listing.id] = listing;
-    }
-  }
-
-
-  return result;
 }
 
 
-/* =========================================================
-   FALLBACK TEXT PARSER
-========================================================= */
+/* ---------- extract DAB cards + links ---------- */
 
-function extractListingsFromPlainText(text) {
+async function extractCards(page) {
+  return await page.evaluate(() => {
+    const tidy = text =>
+      (text || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\r/g, '')
+        .replace(/[ \t]+/g, ' ')
+        .replace(/ *\n */g, '\n')
+        .trim();
 
-  const lines =
-    normalize(text)
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean);
+    const roots = [document];
+    const anchors = [];
+    const visited = new Set();
 
+    // Search normal DOM + open shadow DOM.
+    while (roots.length) {
+      const root = roots.pop();
 
-  const results = [];
+      if (!root || visited.has(root))
+        continue;
 
+      visited.add(root);
 
-  for (let i = 0; i < lines.length; i++) {
+      try {
+        anchors.push(...root.querySelectorAll('a[href]'));
 
-    if (
-      !/^(?:Husleje|Rent)\s*:/i.test(lines[i])
-    ) {
-      continue;
+        for (const el of root.querySelectorAll('*')) {
+          if (el.shadowRoot)
+            roots.push(el.shadowRoot);
+        }
+      } catch {}
     }
 
+    const results = [];
 
-    let periodIndex = -1;
+    for (const anchor of anchors) {
+      let node = anchor;
+
+      for (let depth = 0; node && depth < 15; depth++) {
+        const text = tidy(
+          node.innerText || node.textContent || ''
+        );
+
+        const looksLikeHome =
+          /(?:Husleje|Rent)\s*:/i.test(text) &&
+          /(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i.test(text) &&
+          /(?:^|\n)\d{4}\s+\S+/m.test(text);
+
+        if (
+          looksLikeHome &&
+          text.length > 40 &&
+          text.length < 3000
+        ) {
+          let url = '';
+
+          try {
+            url = new URL(
+              anchor.getAttribute('href'),
+              location.href
+            ).href;
+          } catch {}
+
+          results.push({
+            text,
+            url
+          });
+
+          break;
+        }
+
+        node =
+          node.parentElement ||
+          node.getRootNode()?.host ||
+          null;
+      }
+    }
+
+    return results;
+  });
+}
+
+
+/* ---------- fallback parser ---------- */
+
+function parsePageText(text) {
+  const lines = clean(text)
+    .split('\n')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  const homes = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^(Husleje|Rent)\s*:/i.test(lines[i]))
+      continue;
+
+    let end = -1;
 
     for (
       let j = i + 1;
       j <= Math.min(i + 10, lines.length - 1);
       j++
     ) {
-
       if (
-        /^(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i
+        /^(Udlejningsperiode|Lejeperiode|Rental period)\s*:/i
           .test(lines[j])
       ) {
-
-        periodIndex = j;
+        end = j;
         break;
       }
     }
 
-
-    if (periodIndex === -1) {
+    if (end === -1)
       continue;
-    }
 
+    const block = lines
+      .slice(Math.max(0, i - 4), end + 1)
+      .join('\n');
 
-    /*
-      Include enough lines before rent
-      for address + postcode.
-    */
+    const home =
+      parseListing(block, TARGET_URL);
 
-    const start =
-      Math.max(0, i - 4);
-
-
-    const block =
-      lines
-        .slice(
-          start,
-          periodIndex + 1
-        )
-        .join('\n');
-
-
-    const parsed =
-      parseListing(
-        block,
-        TARGET_URL
-      );
-
-
-    if (parsed) {
-      results.push(parsed);
-    }
+    if (home)
+      homes.push(home);
   }
 
-
-  return deduplicateListings(results);
+  return homes;
 }
 
 
-/* =========================================================
-   DEDUPLICATION
-========================================================= */
-
-function deduplicateListings(listings) {
-
-  const map = new Map();
-
-
-  for (const listing of listings) {
-
-    const existing =
-      map.get(listing.id);
-
-
-    if (!existing) {
-      map.set(
-        listing.id,
-        listing
-      );
-
-      continue;
-    }
-
-
-    /*
-      Prefer the listing that has
-      a specific property URL.
-    */
-
-    const existingSpecific =
-      existing.url &&
-      existing.url !== TARGET_URL;
-
-
-    const newSpecific =
-      listing.url &&
-      listing.url !== TARGET_URL;
-
-
-    if (
-      newSpecific &&
-      !existingSpecific
-    ) {
-      map.set(
-        listing.id,
-        listing
-      );
-    }
-  }
-
-
-  return [...map.values()]
-    .sort((a, b) =>
-      a.id.localeCompare(
-        b.id,
-        'da'
-      )
-    );
-}
-
-
-/* =========================================================
-   FIND PROPERTY CARDS + EXACT LINKS
-========================================================= */
-
-async function extractListingsWithLinks(page) {
-
-  /*
-    This JavaScript runs inside the DAB page.
-
-    DAB uses Web Components, so some content
-    can be inside Shadow DOM.
-
-    We recursively search both:
-    - normal document
-    - open Shadow DOM
-  */
-
-  const candidates =
-    await page.evaluate(() => {
-
-      function clean(text = '') {
-        return text
-          .replace(/\u00a0/g, ' ')
-          .replace(/\r/g, '')
-          .replace(/[ \t]+/g, ' ')
-          .replace(/ *\n */g, '\n')
-          .replace(/\n{3,}/g, '\n\n')
-          .trim();
-      }
-
-
-      function getParent(node) {
-
-        if (node.parentElement) {
-          return node.parentElement;
-        }
-
-
-        const root =
-          node.getRootNode?.();
-
-
-        if (
-          root &&
-          root.host
-        ) {
-          return root.host;
-        }
-
-
-        return null;
-      }
-
-
-      /*
-        Collect all links from document
-        and all open shadow roots.
-      */
-
-      const roots =
-        [document];
-
-
-      const anchors =
-        [];
-
-
-      const visitedRoots =
-        new Set();
-
-
-      while (roots.length > 0) {
-
-        const root =
-          roots.pop();
-
-
-        if (
-          !root ||
-          visitedRoots.has(root)
-        ) {
-          continue;
-        }
-
-
-        visitedRoots.add(root);
-
-
-        try {
-
-          for (
-            const anchor
-            of root.querySelectorAll('a[href]')
-          ) {
-            anchors.push(anchor);
-          }
-
-
-          for (
-            const element
-            of root.querySelectorAll('*')
-          ) {
-
-            if (element.shadowRoot) {
-              roots.push(
-                element.shadowRoot
-              );
-            }
-          }
-
-        } catch {
-          // Ignore inaccessible roots.
-        }
-      }
-
-
-      const results =
-        [];
-
-
-      for (const anchor of anchors) {
-
-        let node =
-          anchor;
-
-
-        /*
-          Walk upward until we find the
-          smallest element that looks like
-          one complete housing card.
-        */
-
-        for (
-          let depth = 0;
-          node && depth < 18;
-          depth++
-        ) {
-
-          const text =
-            clean(
-              node.innerText ||
-              node.textContent ||
-              ''
-            );
-
-
-          const hasRent =
-            /(?:^|\n)\s*(?:Husleje|Rent)\s*:/i
-              .test(text);
-
-
-          const hasPeriod =
-            /(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i
-              .test(text);
-
-
-          const hasPostcode =
-            /(?:^|\n)\d{4}\s+\S+/m
-              .test(text);
-
-
-          /*
-            Avoid accidentally selecting
-            the entire webpage.
-          */
-
-          if (
-            hasRent &&
-            hasPeriod &&
-            hasPostcode &&
-            text.length >= 40 &&
-            text.length <= 3000
-          ) {
-
-            let href = '';
-
-            try {
-              href =
-                new URL(
-                  anchor.getAttribute('href'),
-                  location.href
-                ).href;
-            } catch {
-              href =
-                anchor.href || '';
-            }
-
-
-            if (
-              href &&
-              !href.startsWith('javascript:')
-            ) {
-
-              results.push({
-                text,
-                url: href
-              });
-            }
-
-
-            break;
-          }
-
-
-          node =
-            getParent(node);
-        }
-      }
-
-
-      return results;
-    });
-
-
-  const parsed = [];
-
-
-  for (const candidate of candidates) {
-
-    const listing =
-      parseListing(
-        candidate.text,
-        candidate.url
-      );
-
-
-    if (listing) {
-      parsed.push(listing);
-    }
-  }
-
-
-  return deduplicateListings(parsed);
-}
-
-
-/* =========================================================
-   GET CURRENT DAB LISTINGS
-========================================================= */
-
-async function getCurrentListings(page) {
-
-  console.log(
-    'Opening DAB temporary housing page...'
-  );
-
-
-  await page.goto(
-    TARGET_URL,
-    {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000
-    }
-  );
-
-
-  /*
-    DAB loads listings using JavaScript.
-
-    Wait up to 30 seconds.
-  */
+/* ---------- get current listings ---------- */
+
+async function getListings(page) {
+  console.log('Opening DAB...');
+
+  await page.goto(TARGET_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: 45000
+  });
 
   let renderedText = '';
 
-
-  for (
-    let attempt = 1;
-    attempt <= 30;
-    attempt++
-  ) {
-
-    renderedText =
-      await page
-        .locator('main')
-        .innerText()
-        .catch(() => '');
-
-
-    const hasRent =
-      /(?:Husleje|Rent)\s*:/i
-        .test(renderedText);
-
-
-    const hasPeriod =
-      /(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i
-        .test(renderedText);
-
+  // Wait up to 30 seconds for JavaScript housing data.
+  for (let i = 1; i <= 30; i++) {
+    renderedText = await page
+      .locator('main')
+      .innerText()
+      .catch(() => '');
 
     if (
-      hasRent &&
-      hasPeriod
+      /(?:Husleje|Rent)\s*:/i.test(renderedText) &&
+      /(?:Udlejningsperiode|Rental period)\s*:/i
+        .test(renderedText)
     ) {
-
-      console.log(
-        `DAB housing data loaded after ${attempt} second(s).`
-      );
-
+      console.log(`Housing loaded after ${i}s.`);
       break;
     }
-
 
     await page.waitForTimeout(1000);
   }
 
+  const cards =
+    await extractCards(page);
 
-  /*
-    First try DOM-based extraction because
-    this gives us the exact property links.
-  */
+  const homes = [];
 
-  let listings =
-    await extractListingsWithLinks(page);
+  for (const card of cards) {
+    const home =
+      parseListing(card.text, card.url || TARGET_URL);
 
-
-  console.log(
-    `Listings found with property links: ${listings.length}`
-  );
-
-
-  /*
-    If DOM extraction fails,
-    fall back to rendered text.
-
-    Notifications will still work,
-    but those particular listings may
-    open the general DAB page.
-  */
-
-  if (listings.length === 0) {
-
-    console.log(
-      'Exact-link extraction failed. Trying text fallback...'
-    );
-
-
-    listings =
-      extractListingsFromPlainText(
-        renderedText
-      );
+    if (home)
+      homes.push(home);
   }
 
-
-  /*
-    Safety:
-    never save an empty list.
-  */
-
-  if (listings.length === 0) {
-
-    console.log(
-      '\n--- DAB DEBUG OUTPUT ---\n'
-    );
-
-    console.log(
-      renderedText.slice(
-        0,
-        8000
-      )
-    );
-
-    console.log(
-      '\n--- END DEBUG ---\n'
-    );
-
-
-    throw new Error(
-      'No eligible DAB housing listings were detected. State was NOT changed.'
-    );
+  // If card/link extraction fails, still monitor via text.
+  if (!homes.length) {
+    console.log('Using text fallback.');
+    homes.push(...parsePageText(renderedText));
   }
 
+  // Deduplicate by address.
+  const map = new Map();
 
-  console.log(
-    `Tracking ${listings.length} home(s) with postcode 0000-${MAX_POSTCODE}.`
-  );
+  for (const home of homes) {
+    const old = map.get(home.id);
 
-
-  for (const listing of listings) {
-
-    console.log(
-      `- ${listing.address}, ${listing.postcode} ${listing.city}`
-    );
-
+    // Prefer version containing an exact property URL.
     if (
-      listing.url &&
-      listing.url !== TARGET_URL
+      !old ||
+      (
+        old.url === TARGET_URL &&
+        home.url !== TARGET_URL
+      )
     ) {
-
-      console.log(
-        `  Exact link: ${listing.url}`
-      );
+      map.set(home.id, home);
     }
   }
 
+  const result = [...map.values()]
+    .sort((a, b) => a.id.localeCompare(b.id, 'da'));
 
-  return listings;
-}
-
-
-/* =========================================================
-   ENGLISH NOTIFICATION TEXT
-========================================================= */
-
-function buildNotificationMessage(listing) {
-
-  const lines = [
-    `${listing.address}`,
-    `${listing.postcode} ${listing.city}`
-  ];
-
-
-  if (listing.rent) {
-    lines.push(
-      `Rent: ${listing.rent}`
-    );
-  }
-
-
-  if (listing.deposit) {
-    lines.push(
-      `Deposit: ${listing.deposit}`
-    );
-  }
-
-
-  const propertyDetails = [];
-
-
-  if (listing.propertyType) {
-    propertyDetails.push(
-      listing.propertyType
-    );
-  }
-
-
-  if (listing.rooms) {
-
-    propertyDetails.push(
-      `${listing.rooms} ${
-        listing.rooms === '1'
-          ? 'room'
-          : 'rooms'
-      }`
-    );
-  }
-
-
-  if (listing.area) {
-    propertyDetails.push(
-      listing.area
-    );
-  }
-
-
-  if (propertyDetails.length) {
-
-    lines.push(
-      propertyDetails.join(' • ')
-    );
-  }
-
-
-  if (listing.period) {
-
-    lines.push(
-      `Rental period: ${listing.period}`
-    );
-  }
-
-
-  if (
-    listing.url &&
-    listing.url !== TARGET_URL
-  ) {
-
-    lines.push('');
-    lines.push(
-      'Tap this notification to open this exact home.'
-    );
-
-  } else {
-
-    lines.push('');
-    lines.push(
-      'Tap to open the DAB temporary housing page.'
-    );
-  }
-
-
-  return lines.join('\n');
-}
-
-
-/* =========================================================
-   SEND NTFY
-========================================================= */
-
-async function sendNtfy(
-  title,
-  message,
-  clickUrl,
-  tags
-) {
-
-  if (!NTFY_TOPIC) {
-
-    console.log(
-      'NTFY_TOPIC is missing.'
-    );
-
-    return;
-  }
-
-
-  const response =
-    await fetch(
-      NTFY_SERVER,
-      {
-        method: 'POST',
-
-        headers: {
-          'Content-Type':
-            'application/json'
-        },
-
-        body: JSON.stringify({
-          topic: NTFY_TOPIC,
-          title,
-          message,
-          priority: 5,
-          tags,
-          click:
-            clickUrl ||
-            TARGET_URL
-        })
-      }
-    );
-
-
-  if (!response.ok) {
-
+  if (!result.length) {
     throw new Error(
-      `ntfy returned HTTP ${response.status}: ${await response.text()}`
+      'No DAB homes with postcode 0000-3000 were detected.'
     );
   }
+
+  console.log(
+    `Tracking ${result.length} homes with postcode ≤ ${MAX_POSTCODE}.`
+  );
+
+  for (const home of result) {
+    console.log(
+      `${home.address}, ${home.postcode} ${home.city}`
+    );
+
+    if (home.url !== TARGET_URL)
+      console.log(`Exact link: ${home.url}`);
+  }
+
+  return result;
 }
 
 
-/* =========================================================
-   COMPARE CURRENT VS PREVIOUS
-========================================================= */
+/* ---------- compare ---------- */
 
-async function compareAndNotify(
-  currentListings
-) {
+async function compare(currentHomes) {
+  const previous = loadState();
 
-  const rawPrevious =
-    loadRawState();
-
-
-  const previous =
-    migrateOldState(
-      rawPrevious
-    );
-
-
-  const current = {};
-
-
-  for (const listing of currentListings) {
-    current[listing.id] = listing;
-  }
-
-
-  const previousIds =
-    Object.keys(previous);
-
-
-  /*
-    Completely fresh installation.
-  */
-
-  if (previousIds.length === 0) {
-
-    saveState(
-      currentListings
-    );
-
-
-    await sendNtfy(
-      '✅ DAB Housing Monitor Ready',
-
-      `Monitoring ${currentListings.length} current home(s) with postcode 0000-${MAX_POSTCODE}.\n\nYou will be notified when a new home appears or an existing home changes.`,
-
-      TARGET_URL,
-
-      [
-        'white_check_mark',
-        'house'
-      ]
-    );
-
+  // First run with this compact version:
+  // create baseline without sending dozens of NEW alerts.
+  if (!previous) {
+    saveState(currentHomes);
 
     console.log(
-      'New baseline created.'
+      `Baseline created with ${currentHomes.length} homes.`
     );
-
 
     return;
   }
 
+  let newCount = 0;
+  let updatedCount = 0;
 
-  const newHomes =
-    [];
-
-
-  const updatedHomes =
-    [];
-
-
-  for (
-    const listing
-    of currentListings
-  ) {
-
-    const old =
-      previous[
-        listing.id
-      ];
-
-
-    /*
-      NEW PROPERTY
-    */
+  for (const home of currentHomes) {
+    const old = previous[home.id];
 
     if (!old) {
+      newCount++;
 
-      newHomes.push(
-        listing
+      await notify(
+        '🏠 NEW DAB HOME',
+        home,
+        ['house', 'new']
       );
 
       continue;
     }
 
+    if (old.signature !== home.signature) {
+      updatedCount++;
 
-    /*
-      UPDATED PROPERTY
-    */
-
-    if (
-      old.signature &&
-      old.signature !== listing.signature
-    ) {
-
-      updatedHomes.push(
-        listing
+      await notify(
+        '🔄 DAB HOME UPDATED',
+        home,
+        ['house', 'arrows_counterclockwise']
       );
-
-      continue;
-    }
-
-
-    /*
-      Older migrated state may not
-      contain a signature.
-
-      Calculate it from the old values.
-    */
-
-    if (!old.signature) {
-
-      const oldSignature =
-        sha256(
-          JSON.stringify({
-            address: old.address || '',
-            postcode: old.postcode || '',
-            city: old.city || '',
-            rent: old.rent || '',
-            deposit: old.deposit || '',
-            propertyType: old.propertyType || '',
-            rooms: old.rooms || '',
-            area: old.area || '',
-            period: old.period || ''
-          })
-        );
-
-
-      if (
-        oldSignature !==
-        listing.signature
-      ) {
-
-        updatedHomes.push(
-          listing
-        );
-      }
     }
   }
 
+  // Removed homes are deliberately ignored.
+  saveState(currentHomes);
 
-  console.log(
-    `New homes: ${newHomes.length}`
-  );
+  console.log(`New homes: ${newCount}`);
+  console.log(`Updated homes: ${updatedCount}`);
 
-
-  console.log(
-    `Updated homes: ${updatedHomes.length}`
-  );
-
-
-  /*
-    NEW HOME NOTIFICATIONS
-  */
-
-  for (
-    const listing
-    of newHomes
-  ) {
-
-    await sendNtfy(
-      '🏠 NEW DAB HOME',
-
-      buildNotificationMessage(
-        listing
-      ),
-
-      listing.url,
-
-      [
-        'house',
-        'new'
-      ]
-    );
-
-
-    console.log(
-      `NEW: ${listing.address}`
-    );
-  }
-
-
-  /*
-    UPDATED HOME NOTIFICATIONS
-  */
-
-  for (
-    const listing
-    of updatedHomes
-  ) {
-
-    await sendNtfy(
-      '🔄 DAB HOME UPDATED',
-
-      buildNotificationMessage(
-        listing
-      ),
-
-      listing.url,
-
-      [
-        'house',
-        'arrows_counterclockwise'
-      ]
-    );
-
-
-    console.log(
-      `UPDATED: ${listing.address}`
-    );
-  }
-
-
-  /*
-    Removed homes are intentionally ignored.
-
-    We still save the latest state,
-    so if a removed home later comes back,
-    it will correctly count as NEW.
-  */
-
-  saveState(
-    currentListings
-  );
-
-
-  if (
-    newHomes.length === 0 &&
-    updatedHomes.length === 0
-  ) {
-
-    console.log(
-      'No relevant housing changes.'
-    );
-  }
+  if (!newCount && !updatedCount)
+    console.log('No relevant changes.');
 }
 
 
-/* =========================================================
-   MAIN
-========================================================= */
+/* ---------- main ---------- */
 
 async function main() {
+  if (!fs.existsSync(CHROME_PATH))
+    throw new Error(`Chrome not found: ${CHROME_PATH}`);
 
-  if (
-    !fs.existsSync(
-      CHROME_PATH
-    )
-  ) {
+  const browser = await chromium.launch({
+    executablePath: CHROME_PATH,
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
+  });
 
-    throw new Error(
-      `Chrome not found at ${CHROME_PATH}`
-    );
-  }
-
-
-  console.log(
-    `Watching DAB postcodes 0000-${MAX_POSTCODE}.`
-  );
-
-
-  const browser =
-    await chromium.launch({
-
-      executablePath:
-        CHROME_PATH,
-
-      headless: true,
-
-      args: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
-    });
-
-
-  const context =
-    await browser.newContext({
-
-      /*
-        Danish page gives us predictable
-        Husleje / Indskud / Udlejningsperiode
-        labels.
-
-        Notifications are translated to English.
-      */
-
-      locale: 'da-DK',
-
-      viewport: {
-        width: 1280,
-        height: 1200
-      },
-
-      userAgent:
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36'
-    });
-
-
-  /*
-    Images, videos and fonts are unnecessary.
-  */
-
-  await context.route(
-    '**/*',
-
-    async route => {
-
-      const type =
-        route
-          .request()
-          .resourceType();
-
-
-      if (
-        [
-          'image',
-          'font',
-          'media'
-        ].includes(type)
-      ) {
-
-        return route.abort();
-      }
-
-
-      return route.continue();
+  const context = await browser.newContext({
+    locale: 'da-DK',
+    viewport: {
+      width: 1280,
+      height: 1200
     }
-  );
+  });
 
+  // We only need text and links.
+  await context.route('**/*', async route => {
+    const type = route.request().resourceType();
 
-  const page =
-    await context.newPage();
+    if (['image', 'font', 'media'].includes(type))
+      return route.abort();
 
+    return route.continue();
+  });
+
+  const page = await context.newPage();
 
   try {
+    const homes =
+      await getListings(page);
 
-    const listings =
-      await getCurrentListings(
-        page
-      );
-
-
-    await compareAndNotify(
-      listings
-    );
-
+    await compare(homes);
   } finally {
-
     await browser.close();
   }
 }
 
-
-/* =========================================================
-   START
-========================================================= */
-
 main().catch(error => {
-
-  console.error(
-    '\nMONITOR ERROR:\n'
-  );
-
-
-  console.error(
-    error?.stack ||
-    error
-  );
-
-
+  console.error('\nMONITOR ERROR:\n');
+  console.error(error?.stack || error);
   process.exitCode = 1;
 });
