@@ -1,0 +1,14 @@
+{
+  "name": "dab-housing-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Monitor DAB-Lejerbo temporary housing listings and notify via ntfy",
+  "scripts": {
+    "monitor": "node monitor.mjs",
+    "check": "node --check monitor.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}
