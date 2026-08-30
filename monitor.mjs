@@ -10,7 +10,7 @@ const NTFY_SERVER =
   (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
-const STATE_FILE = process.env.STATE_FILE || 'state.json';
+const STATE_FILE = 'state.json';
 
 const CHECKS_PER_RUN =
   Math.max(1, Number(process.env.CHECKS_PER_RUN || 5));
@@ -21,6 +21,10 @@ const INTERVAL_SECONDS =
 const CHROME_PATH =
   process.env.CHROME_PATH || '/usr/bin/google-chrome';
 
+
+/* -------------------------------------------------------
+   Helpers
+------------------------------------------------------- */
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -38,13 +42,17 @@ function normalize(text = '') {
 }
 
 
-function sha256(text) {
+function hash(value) {
   return crypto
     .createHash('sha256')
-    .update(text)
+    .update(value)
     .digest('hex');
 }
 
+
+/* -------------------------------------------------------
+   State
+------------------------------------------------------- */
 
 function loadState() {
   try {
@@ -57,12 +65,15 @@ function loadState() {
 }
 
 
-function saveState(snapshot) {
+function saveState(listings) {
+  const snapshot = JSON.stringify(listings);
+
   const state = {
-    version: 2,
+    version: 3,
     updated_at: new Date().toISOString(),
-    hash: sha256(snapshot),
-    snapshot,
+    count: listings.length,
+    hash: hash(snapshot),
+    listings: listings
   };
 
   fs.writeFileSync(
@@ -72,9 +83,15 @@ function saveState(snapshot) {
 }
 
 
+/* -------------------------------------------------------
+   ntfy
+------------------------------------------------------- */
+
 async function sendNtfy(title, message, tags = ['house']) {
+
   if (!NTFY_TOPIC) {
-    console.log(`[ntfy disabled] ${title}`);
+    console.log('NTFY_TOPIC is missing.');
+    console.log(title);
     console.log(message);
     return;
   }
@@ -83,64 +100,78 @@ async function sendNtfy(title, message, tags = ['house']) {
     method: 'POST',
 
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json'
     },
 
     body: JSON.stringify({
       topic: NTFY_TOPIC,
-      title,
-      message,
+      title: title,
+      message: message,
       priority: 4,
-      tags,
-      click: TARGET_URL,
-    }),
+      tags: tags,
+      click: TARGET_URL
+    })
   });
 
   if (!response.ok) {
     throw new Error(
-      `ntfy HTTP ${response.status}: ${await response.text()}`
+      `ntfy error ${response.status}: ${await response.text()}`
     );
   }
 }
 
 
-async function sendSnapshot(title, snapshot, tags) {
-  const MAX_CHARS = 2800;
+/*
+   ntfy messages have a size limit.
 
-  const lines = snapshot.split('\n');
+   If there are many apartments,
+   divide the current list into several notifications.
+*/
+
+async function sendListingNotifications(title, listings, tags) {
+
+  const MAX_LENGTH = 2800;
+
+  const formatted = listings.map(
+    (listing, index) =>
+      `${index + 1}. ${listing}`
+  );
 
   const chunks = [];
-  let current = '';
 
-  for (const line of lines) {
+  let current =
+    `Current listings: ${listings.length}\n\n`;
+
+  for (const listing of formatted) {
+
     const candidate =
-      current
-        ? `${current}\n${line}`
-        : line;
+      current + listing + '\n\n';
 
     if (
-      candidate.length > MAX_CHARS &&
-      current
+      candidate.length > MAX_LENGTH &&
+      current.trim()
     ) {
-      chunks.push(current);
-      current = line;
+      chunks.push(current.trim());
+      current = listing + '\n\n';
     } else {
       current = candidate;
     }
   }
 
-  if (current) {
-    chunks.push(current);
+  if (current.trim()) {
+    chunks.push(current.trim());
   }
 
+
   for (let i = 0; i < chunks.length; i++) {
+
     const suffix =
       chunks.length > 1
         ? ` (${i + 1}/${chunks.length})`
         : '';
 
     await sendNtfy(
-      `${title}${suffix}`,
+      title + suffix,
       chunks[i],
       tags
     );
@@ -148,166 +179,318 @@ async function sendSnapshot(title, snapshot, tags) {
 }
 
 
-function cleanSnapshot(text) {
-  const lines = normalize(text)
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean);
+/* -------------------------------------------------------
+   DAB listing parser
+------------------------------------------------------- */
 
-  const ignored = new Set([
-    'Log in',
-    'Login',
-    'Menu',
-    'Search',
-    'Søg',
-    'Soeg',
-  ]);
+/*
+   DAB currently uses Danish:
 
-  return lines
-    .filter(line => !ignored.has(line))
-    .join('\n');
+   Husleje:
+   Indskud:
+   Udlejningsperiode:
+
+   But English alternatives are included too
+   in case DAB changes language.
+*/
+
+const RENT =
+  /^(?:Husleje|Rent)\s*:/i;
+
+const DEPOSIT =
+  /^(?:Indskud|Depositum|Deposit)\s*:/i;
+
+const PERIOD =
+  /^(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i;
+
+
+/*
+   Example from the actual DAB page:
+
+   Rødovre Parkvej 229 7. sal
+   2610 Rødovre
+   Husleje: 7.180 kr.
+   Indskud: 23.304 kr.
+   Etagebolig, 3 rums, 85 kvm
+   Udlejningsperiode: 15-09-2026 - 15-03-2027
+
+   We use "Husleje:" as the anchor.
+
+   The two lines immediately before it are normally:
+   address
+   postcode/city
+
+   Then we collect everything until
+   Udlejningsperiode.
+*/
+
+function extractListings(pageText) {
+
+  const lines =
+    normalize(pageText)
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+
+  const listings = [];
+
+
+  for (let i = 0; i < lines.length; i++) {
+
+    if (!RENT.test(lines[i])) {
+      continue;
+    }
+
+
+    /*
+       Find rental period after this rent line.
+       Usually it is within 3-5 lines.
+    */
+
+    let periodIndex = -1;
+
+    for (
+      let j = i + 1;
+      j <= Math.min(i + 8, lines.length - 1);
+      j++
+    ) {
+
+      if (PERIOD.test(lines[j])) {
+        periodIndex = j;
+        break;
+      }
+    }
+
+
+    /*
+       If there's no rental period,
+       don't consider this a valid housing listing.
+    */
+
+    if (periodIndex === -1) {
+      continue;
+    }
+
+
+    /*
+       Address + postcode/city.
+    */
+
+    const start =
+      Math.max(0, i - 2);
+
+
+    const listingLines =
+      lines.slice(
+        start,
+        periodIndex + 1
+      );
+
+
+    /*
+       Require a rent and either deposit or period.
+    */
+
+    const joined =
+      listingLines.join('\n');
+
+
+    if (!RENT.test(listingLines.find(x => RENT.test(x)) || '')) {
+      continue;
+    }
+
+
+    if (
+      !listingLines.some(x => DEPOSIT.test(x)) &&
+      !listingLines.some(x => PERIOD.test(x))
+    ) {
+      continue;
+    }
+
+
+    listings.push(joined);
+  }
+
+
+  /*
+     Remove duplicate listings.
+  */
+
+  const unique =
+    [...new Set(listings)];
+
+
+  /*
+     Sort them so a simple change in website order
+     does NOT trigger a notification.
+  */
+
+  unique.sort((a, b) =>
+    a.localeCompare(b, 'da')
+  );
+
+
+  return unique;
 }
 
 
-async function getHousingSnapshot(page) {
+/* -------------------------------------------------------
+   Load DAB
+------------------------------------------------------- */
+
+async function getCurrentListings(page) {
+
+  console.log('Opening DAB...');
+
   await page.goto(TARGET_URL, {
     waitUntil: 'domcontentloaded',
-    timeout: 45000,
+    timeout: 45000
   });
 
-  console.log(
-    'Waiting for DAB housing data...'
-  );
 
-  await page.waitForTimeout(10000);
+  /*
+     DAB inserts housing data with JavaScript.
 
-  let text =
-    await page
-      .locator('main')
-      .innerText({
-        timeout: 10000,
-      })
-      .catch(() => '');
+     Check once every second for up to 30 seconds.
+  */
+
+  let pageText = '';
+
+  for (let attempt = 1; attempt <= 30; attempt++) {
+
+    pageText =
+      await page
+        .locator('main')
+        .innerText()
+        .catch(() => '');
 
 
-  if (!text) {
-    text =
+    if (
+      /(?:Husleje|Rent)\s*:/i.test(pageText) &&
+      /(?:Udlejningsperiode|Lejeperiode|Rental period)\s*:/i.test(pageText)
+    ) {
+      console.log(
+        `Housing data appeared after ${attempt} second(s).`
+      );
+
+      break;
+    }
+
+
+    await page.waitForTimeout(1000);
+  }
+
+
+  if (!pageText) {
+    pageText =
       await page
         .locator('body')
-        .innerText({
-          timeout: 10000,
-        })
+        .innerText()
         .catch(() => '');
   }
 
 
-  let snapshot =
-    cleanSnapshot(text);
+  const listings =
+    extractListings(pageText);
 
 
-  const hasRent =
-    /(?:Rent|Husleje)\s*:/i
-      .test(snapshot);
-
-  const hasDeposit =
-    /(?:Deposit|Depositum)\s*:/i
-      .test(snapshot);
-
-  const hasPeriod =
-    /(?:Rental period|Lejeperiode)\s*:/i
-      .test(snapshot);
-
-
-  if (
-    !hasRent ||
-    (!hasDeposit && !hasPeriod)
-  ) {
-    console.log(
-      '\nRendered page text:\n'
-    );
-
-    console.log(
-      snapshot.slice(0, 7000)
-    );
-
-    throw new Error(
-      'DAB housing listings were not found. State was NOT changed.'
-    );
-  }
+  console.log(
+    `Detected ${listings.length} housing listing(s).`
+  );
 
 
   /*
-   * Remove most of the static text above
-   * the actual housing listings.
-   *
-   * Keep a few lines before the first Rent/Husleje
-   * so the first apartment address is not lost.
-   */
+     Safety:
+     Never overwrite state with zero listings.
 
-  const marker =
-    snapshot.search(
-      /(?:Rent|Husleje)\s*:/i
+     If DAB temporarily fails to load,
+     we don't want dozens of false notifications.
+  */
+
+  if (listings.length === 0) {
+
+    console.log('\n--- DEBUG PAGE TEXT ---\n');
+
+    console.log(
+      pageText.slice(0, 8000)
     );
 
+    console.log('\n--- END DEBUG ---\n');
 
-  if (marker > 0) {
-    const before =
-      snapshot.slice(0, marker);
 
-    const lines =
-      before.split('\n');
-
-    const keepFrom =
-      Math.max(
-        0,
-        lines.length - 4
-      );
-
-    snapshot =
-      [
-        ...lines.slice(keepFrom),
-        snapshot.slice(marker),
-      ].join('\n');
+    throw new Error(
+      'No DAB housing listings detected. State was NOT changed.'
+    );
   }
 
 
-  return normalize(snapshot);
+  return listings;
 }
 
 
-async function compareAndNotify(snapshot) {
+/* -------------------------------------------------------
+   Compare
+------------------------------------------------------- */
+
+async function compareListings(currentListings) {
+
   const previous =
     loadState();
 
+
   const currentHash =
-    sha256(snapshot);
+    hash(
+      JSON.stringify(currentListings)
+    );
 
 
   /*
-   * FIRST SUCCESSFUL RUN
-   *
-   * Save current housing list and
-   * send the whole list to your phone.
-   */
+     FIRST SUCCESSFUL RUN
+
+     Send all current housing listings.
+  */
 
   if (
-    !previous.version ||
+    previous.version !== 3 ||
     !previous.hash ||
-    !previous.snapshot
+    !Array.isArray(previous.listings)
   ) {
-    saveState(snapshot);
 
-    await sendSnapshot(
-      '🏠 DAB CURRENT LISTINGS',
-      snapshot,
+    saveState(currentListings);
+
+
+    await sendListingNotifications(
+      `🏠 DAB CURRENT LISTINGS`,
+      currentListings,
       [
         'house',
-        'white_check_mark',
+        'white_check_mark'
       ]
     );
 
+
     console.log(
-      'Current listings saved and sent to ntfy.'
+      `Baseline created with ${currentListings.length} listings.`
+    );
+
+    console.log(
+      'Current listings sent to ntfy.'
+    );
+
+
+    return;
+  }
+
+
+  /*
+     NO CHANGE
+  */
+
+  if (previous.hash === currentHash) {
+
+    console.log(
+      `No changes. Still ${currentListings.length} listings.`
     );
 
     return;
@@ -315,102 +498,119 @@ async function compareAndNotify(snapshot) {
 
 
   /*
-   * NOTHING CHANGED
-   */
+     SOMETHING CHANGED
 
-  if (
-    previous.hash === currentHash
-  ) {
-    console.log(
-      'No housing changes detected.'
-    );
+     Could be:
+     - new apartment
+     - removed apartment
+     - rent changed
+     - deposit changed
+     - dates changed
+     - rooms/size changed
 
-    return;
-  }
+     User requested the COMPLETE CURRENT LIST
+     whenever something changes.
+  */
+
+  const oldCount =
+    previous.listings.length;
+
+  const newCount =
+    currentListings.length;
 
 
-  /*
-   * SOMETHING CHANGED
-   *
-   * Save new version and send
-   * the COMPLETE current housing list.
-   */
+  console.log(
+    `Housing changed: ${oldCount} → ${newCount} listings.`
+  );
 
-  saveState(snapshot);
 
-  await sendSnapshot(
-    '🔄 DAB LISTINGS UPDATED',
-    snapshot,
+  saveState(currentListings);
+
+
+  await sendListingNotifications(
+    `🔄 DAB LISTINGS UPDATED`,
+    currentListings,
     [
       'house',
-      'arrows_counterclockwise',
+      'arrows_counterclockwise'
     ]
   );
 
+
   console.log(
-    'Housing list changed. Updated list sent to ntfy.'
+    'Updated complete housing list sent to ntfy.'
   );
 }
 
 
+/* -------------------------------------------------------
+   Main
+------------------------------------------------------- */
+
 async function main() {
-  if (
-    !fs.existsSync(CHROME_PATH)
-  ) {
+
+  if (!fs.existsSync(CHROME_PATH)) {
+
     throw new Error(
-      `Chrome not found at ${CHROME_PATH}`
+      `Chrome not found: ${CHROME_PATH}`
     );
   }
 
 
   const browser =
     await chromium.launch({
+
       executablePath: CHROME_PATH,
+
       headless: true,
 
       args: [
         '--no-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-      ],
+        '--disable-gpu'
+      ]
     });
 
 
   const context =
     await browser.newContext({
-      locale: 'en-GB',
+
+      locale: 'da-DK',
 
       viewport: {
         width: 1280,
-        height: 1200,
+        height: 1200
       },
 
       userAgent:
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36'
     });
 
 
   /*
-   * Images/fonts/videos are unnecessary.
-   */
+     We don't need images/videos/fonts.
+     This makes each check faster and cheaper.
+  */
 
   await context.route(
     '**/*',
 
     async route => {
+
       const type =
-        route.request()
-          .resourceType();
+        route.request().resourceType();
+
 
       if (
         [
           'image',
           'font',
-          'media',
+          'media'
         ].includes(type)
       ) {
         return route.abort();
       }
+
 
       return route.continue();
     }
@@ -422,10 +622,11 @@ async function main() {
 
 
   try {
+
     for (
-      let i = 0;
-      i < CHECKS_PER_RUN;
-      i++
+      let check = 1;
+      check <= CHECKS_PER_RUN;
+      check++
     ) {
 
       const started =
@@ -433,41 +634,51 @@ async function main() {
 
 
       console.log(
-        `\nCheck ${i + 1}/${CHECKS_PER_RUN}`
+        `\n==============================`
       );
-
-
-      const snapshot =
-        await getHousingSnapshot(page);
-
 
       console.log(
-        `Captured ${snapshot.length} characters of housing information.`
+        `Check ${check}/${CHECKS_PER_RUN}`
+      );
+
+      console.log(
+        new Date().toISOString()
+      );
+
+      console.log(
+        `==============================`
       );
 
 
-      await compareAndNotify(
-        snapshot
+      const listings =
+        await getCurrentListings(page);
+
+
+      await compareListings(
+        listings
       );
 
 
-      if (
-        i <
-        CHECKS_PER_RUN - 1
-      ) {
+      /*
+         Wait until approximately the next minute.
+      */
+
+      if (check < CHECKS_PER_RUN) {
 
         const elapsed =
-          Date.now() -
-          started;
+          Date.now() - started;
 
 
         const wait =
           Math.max(
             1000,
-            INTERVAL_SECONDS *
-              1000 -
-              elapsed
+            INTERVAL_SECONDS * 1000 - elapsed
           );
+
+
+        console.log(
+          `Waiting ${Math.round(wait / 1000)} seconds...`
+        );
 
 
         await sleep(wait);
@@ -475,14 +686,23 @@ async function main() {
     }
 
   } finally {
+
     await browser.close();
   }
 }
 
 
+/* -------------------------------------------------------
+   Start
+------------------------------------------------------- */
+
 main().catch(error => {
+
   console.error(
-    '\nMONITOR ERROR:',
+    '\nMONITOR ERROR:\n'
+  );
+
+  console.error(
     error?.stack || error
   );
 
