@@ -50,9 +50,16 @@ jobs:
             exit 0
           fi
 
+          cp state.json /tmp/dab-state.json
+
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+
+          cp /tmp/dab-state.json state.json
+
           git config user.name "dab-housing-monitor[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add state.json
           git commit -m "Update DAB housing monitor state"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
